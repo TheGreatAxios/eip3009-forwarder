@@ -11,7 +11,6 @@ import {EIP3009Forwarder} from "./EIP3009Forwarder.sol";
  * @author TheGreatAxios
  * @notice Extended forwarder with ERC-1271 smart contract wallet support.
  * @dev Extends EIP3009Forwarder to support signatures from smart contracts implementing ERC-1271.
- *      Contract wallets must be whitelisted before use.
  */
 contract EIP3009ForwarderExtended is EIP3009Forwarder {
     using SafeERC20 for IERC20;
@@ -24,19 +23,13 @@ contract EIP3009ForwarderExtended is EIP3009Forwarder {
     bytes4 private constant ERC1271_MAGIC_VALUE = 0x1626ba7e;
 
     /// @dev Default gas limit for ERC-1271 validation calls (prevents griefing)
-    uint256 private constant DEFAULT_ERC1271_GAS_LIMIT = 100000;
+    uint256 private constant DEFAULT_ERC1271_GAS_LIMIT = 50000;
 
     // =============================================================
     //                           State
     // =============================================================
 
-    /// @dev Mapping of whitelisted smart contract wallets (required for ERC-1271 signatures)
-    mapping(address => bool) private _whitelistedWallets;
-
-    /// @dev Whether the wallet whitelist is enabled
-    bool private _whitelistEnabled;
-
-    /// @dev Address with admin privileges to manage whitelist and settings
+    /// @dev Address with admin privileges to manage settings
     address private _admin;
 
     /// @dev Pending admin address for two-step transfer process
@@ -50,7 +43,6 @@ contract EIP3009ForwarderExtended is EIP3009Forwarder {
     // =============================================================
 
     error ERC1271ValidationFailed();
-    error WalletNotWhitelisted();
     error NotAdmin();
     error InvalidERC1271Return();
     error InvalidGasLimit();
@@ -60,8 +52,6 @@ contract EIP3009ForwarderExtended is EIP3009Forwarder {
     //                           Events
     // =============================================================
 
-    event WalletWhitelistChanged(address indexed wallet, bool whitelisted);
-    event WhitelistEnabledChanged(bool enabled);
     event AdminTransferInitiated(address indexed currentAdmin, address indexed pendingAdmin);
     event AdminTransferred(address indexed oldAdmin, address indexed newAdmin);
     event AdminTransferRenounced(address indexed currentAdmin);
@@ -76,15 +66,12 @@ contract EIP3009ForwarderExtended is EIP3009Forwarder {
      * @param _token The address of the ERC-20 token.
      * @param _name The name for the EIP-712 domain separator.
      * @param _version The version for the EIP-712 domain separator.
-     * @param _enableWhitelist Whether to enable the wallet whitelist.
      */
-    constructor(address _token, string memory _name, string memory _version, bool _enableWhitelist)
+    constructor(address _token, string memory _name, string memory _version)
         EIP3009Forwarder(_token, _name, _version)
     {
         _admin = msg.sender;
-        _whitelistEnabled = _enableWhitelist;
         _erc1271GasLimit = DEFAULT_ERC1271_GAS_LIMIT;
-        emit WhitelistEnabledChanged(_enableWhitelist);
     }
 
     // =============================================================
@@ -99,27 +86,6 @@ contract EIP3009ForwarderExtended is EIP3009Forwarder {
     // =============================================================
     //                 Administrative Functions
     // =============================================================
-
-    /**
-     * @notice Adds or removes a wallet from the whitelist.
-     * @dev Only callable by admin.
-     * @param wallet The address of the wallet to modify.
-     * @param whitelisted True to add to whitelist, false to remove.
-     */
-    function setWhitelistedWallet(address wallet, bool whitelisted) external onlyAdmin {
-        _whitelistedWallets[wallet] = whitelisted;
-        emit WalletWhitelistChanged(wallet, whitelisted);
-    }
-
-    /**
-     * @notice Enables or disables the wallet whitelist.
-     * @dev Only callable by admin.
-     * @param enabled True to enable whitelist, false to disable.
-     */
-    function setWhitelistEnabled(bool enabled) external onlyAdmin {
-        _whitelistEnabled = enabled;
-        emit WhitelistEnabledChanged(enabled);
-    }
 
     /**
      * @notice Initiates transfer of admin privileges to a new address.
@@ -198,7 +164,6 @@ contract EIP3009ForwarderExtended is EIP3009Forwarder {
 
         bool isFromContract = _isContract(from);
         if (isFromContract) {
-            _validateERC1271Wallet(from);
             _validateERC1271Signature(from, to, value, validAfter, validBefore, nonce, signature);
         } else {
             if (signature.length != 65) revert InvalidSignature();
@@ -263,7 +228,6 @@ contract EIP3009ForwarderExtended is EIP3009Forwarder {
 
         bool isFromContract = _isContract(from);
         if (isFromContract) {
-            _validateERC1271Wallet(from);
             _validateERC1271Signature(from, to, value, validAfter, validBefore, nonce, signature);
         } else {
             if (signature.length != 65) revert InvalidSignature();
@@ -312,7 +276,6 @@ contract EIP3009ForwarderExtended is EIP3009Forwarder {
 
         bool isAuthorizerContract = _isContract(authorizer);
         if (isAuthorizerContract) {
-            _validateERC1271Wallet(authorizer);
             bytes32 cancelHash = keccak256(
                 abi.encode(keccak256("CancelAuthorization(address authorizer,bytes32 nonce)"), authorizer, nonce)
             );
@@ -339,23 +302,6 @@ contract EIP3009ForwarderExtended is EIP3009Forwarder {
     // =============================================================
 
     /**
-     * @notice Checks if a wallet is whitelisted.
-     * @param wallet The address to check.
-     * @return True if whitelisted, false otherwise.
-     */
-    function isWhitelistedWallet(address wallet) external view returns (bool) {
-        return _whitelistedWallets[wallet];
-    }
-
-    /**
-     * @notice Checks if the whitelist is enabled.
-     * @return True if enabled, false otherwise.
-     */
-    function isWhitelistEnabled() external view returns (bool) {
-        return _whitelistEnabled;
-    }
-
-    /**
      * @notice Returns the current admin address.
      * @return The admin address.
      */
@@ -376,27 +322,9 @@ contract EIP3009ForwarderExtended is EIP3009Forwarder {
         return size > 0;
     }
 
-    /// @dev Validates that a contract wallet is whitelisted.
-    function _validateERC1271Wallet(address wallet) internal view {
-        if (!_whitelistedWallets[wallet]) {
-            revert WalletNotWhitelisted();
-        }
-    }
-
-    /// @dev Validates an ERC-1271 signature for a specific hash using staticcall with gas limit.
+    /// @dev Validates an ERC-1271 signature for a specific hash using the EIP-1271 standard pattern.
     function _validateERC1271SignatureHash(address wallet, bytes32 hash, bytes memory signature) internal view {
-        (bool success, bytes memory data) = wallet.staticcall{gas: _erc1271GasLimit}(
-            abi.encodeWithSelector(IERC1271.isValidSignature.selector, hash, signature)
-        );
-
-        if (!success) revert ERC1271ValidationFailed();
-        if (data.length < 32) revert InvalidERC1271Return();
-
-        bytes4 magicValue;
-        assembly {
-            magicValue := mload(add(data, 32))
-        }
-
+        bytes4 magicValue = IERC1271(wallet).isValidSignature(hash, signature);
         if (magicValue != ERC1271_MAGIC_VALUE) revert ERC1271ValidationFailed();
     }
 

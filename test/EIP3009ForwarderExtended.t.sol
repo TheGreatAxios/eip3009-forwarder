@@ -142,8 +142,8 @@ contract EIP3009ForwarderExtendedTest is Test {
         // 3. Deploy a smart wallet for testing ERC-1271
         smartWallet = new MockERC1271Wallet();
 
-        // 4. Deploy the forwarder with whitelist enabled
-        forwarder = new EIP3009ForwarderExtended(address(token), "TestForwarder", "1", true);
+        // 4. Deploy the forwarder
+        forwarder = new EIP3009ForwarderExtended(address(token), "TestForwarder", "1");
 
         // 5. Get the domain separator
         DOMAIN_SEPARATOR = forwarder.DOMAIN_SEPARATOR();
@@ -161,10 +161,6 @@ contract EIP3009ForwarderExtendedTest is Test {
         // 9. Smart wallet approves the forwarder
         vm.prank(address(smartWallet));
         token.approve(address(forwarder), type(uint256).max);
-
-        // 10. Whitelist the smart wallet
-        vm.prank(forwarder.getAdmin());
-        forwarder.setWhitelistedWallet(address(smartWallet), true);
 
         // Label addresses for easier debugging
         vm.label(alice, "Alice");
@@ -294,97 +290,6 @@ contract EIP3009ForwarderExtendedTest is Test {
         forwarder.acceptAdmin();
     }
 
-    /**
-     * @notice Verify access control for whitelist functions.
-     */
-    function testOnlyAdminCanSetWhitelist() public {
-        // Act & Assert: Non-admin tries to set whitelist
-        vm.expectRevert(EIP3009ForwarderExtended.NotAdmin.selector);
-        vm.prank(bob);
-        forwarder.setWhitelistedWallet(bob, true);
-    }
-
-    // =============================================================
-    //                   Whitelist Functions
-    // =============================================================
-
-    /**
-     * @notice Add and remove wallet from whitelist.
-     */
-    function testSetWhitelistedWallet() public {
-        // Arrange
-        address admin = forwarder.getAdmin();
-
-        // Act 1: Add wallet to whitelist
-        vm.prank(admin);
-        forwarder.setWhitelistedWallet(bob, true);
-
-        // Assert 1: Wallet is whitelisted
-        assertTrue(forwarder.isWhitelistedWallet(bob), "Bob should be whitelisted");
-
-        // Act 2: Remove wallet from whitelist
-        vm.prank(admin);
-        forwarder.setWhitelistedWallet(bob, false);
-
-        // Assert 2: Wallet is not whitelisted
-        assertFalse(forwarder.isWhitelistedWallet(bob), "Bob should not be whitelisted");
-    }
-
-    /**
-     * @notice Unlisted wallets rejected when whitelist enabled.
-     */
-    function testWhitelist_PreventsUnlistedWallets() public {
-        // Arrange
-        MockERC1271Wallet unlistedWallet = new MockERC1271Wallet();
-        token.mint(address(unlistedWallet), TRANSFER_AMOUNT);
-        vm.prank(address(unlistedWallet));
-        token.approve(address(forwarder), type(uint256).max);
-
-        // Enable whitelist
-        vm.prank(forwarder.getAdmin());
-        forwarder.setWhitelistEnabled(true);
-
-        // Act & Assert: Unlisted wallet should fail
-        vm.expectRevert(EIP3009ForwarderExtended.WalletNotWhitelisted.selector);
-        forwarder.transferWithAuthorization(
-            address(unlistedWallet),
-            bob,
-            TRANSFER_AMOUNT,
-            0,
-            block.timestamp + 1 hours,
-            keccak256("nonce1"),
-            _createDummySignature()
-        );
-    }
-
-    /**
-     * @notice All wallets work when whitelist disabled.
-     */
-    function testWhitelist_DisabledMode() public {
-        // Arrange
-        MockERC1271Wallet newWallet = new MockERC1271Wallet();
-        token.mint(address(newWallet), TRANSFER_AMOUNT);
-        vm.prank(address(newWallet));
-        token.approve(address(forwarder), type(uint256).max);
-
-        // Disable whitelist
-        vm.prank(forwarder.getAdmin());
-        forwarder.setWhitelistEnabled(false);
-
-        // Add to whitelist (still required for contracts)
-        vm.prank(forwarder.getAdmin());
-        forwarder.setWhitelistedWallet(address(newWallet), true);
-
-        // Act: Transfer should succeed
-        bytes32 nonce = keccak256("nonce1");
-        forwarder.transferWithAuthorization(
-            address(newWallet), bob, TRANSFER_AMOUNT, 0, block.timestamp + 1 hours, nonce, _createDummySignature()
-        );
-
-        // Assert
-        assertEq(token.balanceOf(bob), TRANSFER_AMOUNT, "Bob should receive tokens");
-    }
-
     // =============================================================
     //                   Gas Limit Functions
     // =============================================================
@@ -418,16 +323,16 @@ contract EIP3009ForwarderExtendedTest is Test {
     }
 
     /**
-     * @notice Gas limit > 500000 rejected.
+     * @notice Gas limit > 50000 rejected (50k cap).
      */
     function testSetGasLimit_ExceedsMaximum() public {
         // Arrange
         address admin = forwarder.getAdmin();
 
-        // Act & Assert
+        // Act & Assert: 50k cap enforced
         vm.expectRevert(EIP3009ForwarderExtended.InvalidGasLimit.selector);
         vm.prank(admin);
-        forwarder.setERC1271GasLimit(500001);
+        forwarder.setERC1271GasLimit(50001);
     }
 
     // =============================================================
@@ -512,26 +417,6 @@ contract EIP3009ForwarderExtendedTest is Test {
         vm.expectRevert(EIP3009ForwarderExtended.ERC1271ValidationFailed.selector);
         forwarder.transferWithAuthorization(
             address(smartWallet), bob, TRANSFER_AMOUNT, 0, block.timestamp + 1 hours, nonce, signature
-        );
-    }
-
-    /**
-     * @notice Non-whitelisted wallet rejected.
-     */
-    function testERC1271_NonWhitelistedWalletFails() public {
-        // Arrange
-        MockERC1271Wallet unlistedWallet = new MockERC1271Wallet();
-        token.mint(address(unlistedWallet), TRANSFER_AMOUNT);
-        vm.prank(address(unlistedWallet));
-        token.approve(address(forwarder), type(uint256).max);
-
-        bytes32 nonce = keccak256("unlisted-nonce");
-        bytes memory signature = _createDummySignature();
-
-        // Act & Assert: Non-whitelisted wallet should fail
-        vm.expectRevert(EIP3009ForwarderExtended.WalletNotWhitelisted.selector);
-        forwarder.transferWithAuthorization(
-            address(unlistedWallet), bob, TRANSFER_AMOUNT, 0, block.timestamp + 1 hours, nonce, signature
         );
     }
 
