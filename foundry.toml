@@ -10,3 +10,11 @@ optimizer_runs = 20000000
 remappings = [
 	"@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/"
 ]
+
+[lint]
+exclude_lints = [
+	"mixed-case-function",
+	"mixed-case-variable",
+	"asm-keccak256",
+	"unwrapped-modifier-logic"
+]
