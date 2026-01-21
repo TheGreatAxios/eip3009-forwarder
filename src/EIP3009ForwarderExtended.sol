@@ -67,9 +67,7 @@ contract EIP3009ForwarderExtended is EIP3009Forwarder {
      * @param _name The name for the EIP-712 domain separator.
      * @param _version The version for the EIP-712 domain separator.
      */
-    constructor(address _token, string memory _name, string memory _version)
-        EIP3009Forwarder(_token, _name, _version)
-    {
+    constructor(address _token, string memory _name, string memory _version) EIP3009Forwarder(_token, _name, _version) {
         _admin = msg.sender;
         _erc1271GasLimit = DEFAULT_ERC1271_GAS_LIMIT;
     }
