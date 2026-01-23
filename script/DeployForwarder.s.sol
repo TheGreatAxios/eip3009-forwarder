@@ -18,17 +18,13 @@ import {console} from "forge-std/console.sol";
  *      <erc20_token_address> "<version>"
  */
 contract DeployForwarder is Script {
-    
     /**
      * @notice The main entry point for the deployment script.
      * @param _tokenAddress The address of the ERC20 token to be forwarded.
      * @param _version The version for the EIP-712 domain (e.g., "1").
      * @return The newly deployed EIP3009Forwarder contract instance.
      */
-    function run(
-        address _tokenAddress,
-        string memory _version
-    ) external returns (EIP3009Forwarder) {
+    function run(address _tokenAddress, string memory _version) external returns (EIP3009Forwarder) {
         // --- Input Validation ---
         require(_tokenAddress != address(0), "Token address cannot be the zero address.");
 
@@ -55,7 +51,7 @@ contract DeployForwarder is Script {
 
         // --- Stop Broadcasting ---
         vm.stopBroadcast();
-        
+
         console.log("EIP3009Forwarder deployed at:", address(forwarder));
         console.log("Underlying Token:", forwarder.underlyingToken());
 

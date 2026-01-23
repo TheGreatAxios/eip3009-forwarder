@@ -2,20 +2,23 @@
 pragma solidity ^0.8.0;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {IERC1271} from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /**
  * @title EIP3009Forwarder
- * @author TheGreatAxios
+ * @author TheGreatAxios, Beskay
  * @notice A contract that enables gas-less ERC-20 token transfers using EIP-712 signatures.
  * @dev This contract acts as a forwarder for any standard ERC-20 token, allowing a third-party (relayer)
  * to submit a pre-signed authorization to execute a transfer on behalf of a token holder. The token holder
  * must first approve this contract to spend their tokens. This implementation is based on EIP-3009.
  */
-contract EIP3009Forwarder is EIP712, ReentrancyGuard {
-    using ECDSA for bytes32;
+contract EIP3009Forwarder is EIP712, ReentrancyGuard, Ownable {
+    using SafeERC20 for IERC20;
 
     // =============================================================
     //                           State
@@ -33,6 +36,11 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
      */
     mapping(address => mapping(bytes32 => bool)) private _authorizationStates;
 
+    /**
+     * @notice Gas stipend for ERC-1271 signature validation calls (prevents griefing).
+     * @dev Some smart wallets (plugins/modules) may require more gas. This value can be updated by the owner.
+     */
+    uint256 public erc1271GasStipend;
 
     // =============================================================
     //                       EIP-712 Hashes
@@ -42,15 +50,17 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
      * @dev The EIP-712 type hash for the `transferWithAuthorization` function.
      * The signature is created over a structure with these fields.
      */
-    bytes32 private constant TRANSFER_WITH_AUTHORIZATION_TYPEHASH =
-        keccak256("TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)");
+    bytes32 private constant TRANSFER_WITH_AUTHORIZATION_TYPEHASH = keccak256(
+        "TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"
+    );
 
     /**
      * @dev The EIP-712 type hash for the `receiveWithAuthorization` function.
      * This is a variant of transfer where the recipient (`to`) must be the transaction submitter (`msg.sender`).
      */
-    bytes32 private constant RECEIVE_WITH_AUTHORIZATION_TYPEHASH =
-        keccak256("ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)");
+    bytes32 private constant RECEIVE_WITH_AUTHORIZATION_TYPEHASH = keccak256(
+        "ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"
+    );
 
     /**
      * @dev The EIP-712 type hash for the `cancelAuthorization` function.
@@ -59,6 +69,14 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
     bytes32 private constant CANCEL_AUTHORIZATION_TYPEHASH =
         keccak256("CancelAuthorization(address authorizer,bytes32 nonce)");
 
+    // =============================================================
+    //                      ERC-1271 Defaults
+    // =============================================================
+
+    /**
+     * @dev Default gas stipend for ERC-1271 signature validation calls.
+     */
+    uint256 private constant DEFAULT_ERC1271_GAS_STIPEND = 50_000;
 
     // =============================================================
     //                           Events
@@ -78,6 +96,12 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
      */
     event AuthorizationCanceled(address indexed authorizer, bytes32 indexed nonce);
 
+    /**
+     * @notice Emitted when the ERC-1271 gas stipend is updated.
+     * @param oldGasStipend Previous gas stipend.
+     * @param newGasStipend New gas stipend.
+     */
+    event ERC1271GasStipendUpdated(uint256 oldGasStipend, uint256 newGasStipend);
 
     // =============================================================
     //                         Custom Errors
@@ -99,7 +123,8 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
     error InsufficientBalance();
     /// @notice The provided `validAfter` timestamp is after the `validBefore` timestamp.
     error InvalidAuthorizationDates();
-
+    /// @notice The provided ERC-1271 gas stipend is invalid.
+    error InvalidERC1271GasStipend();
 
     // =============================================================
     //                         Constructor
@@ -111,19 +136,58 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
      * @param _name The name for the EIP-712 domain separator (e.g., "My Forwardable Token").
      * @param _version The version for the EIP-712 domain separator (e.g., "1").
      */
-    constructor(
-        address _token,
-        string memory _name,
-        string memory _version
-    ) EIP712(_name, _version) {
+    constructor(address _token, string memory _name, string memory _version)
+        EIP712(_name, _version)
+        Ownable(msg.sender)
+    {
         if (_token == address(0)) revert ZeroAddress();
         TOKEN = IERC20(_token);
+        erc1271GasStipend = DEFAULT_ERC1271_GAS_STIPEND;
     }
 
+    // =============================================================
+    //                      Owner Functions
+    // =============================================================
+
+    /**
+     * @notice Updates the ERC-1271 gas stipend used for contract wallet signature validation.
+     * @dev This function exists to support contract wallets that require more gas for signature checks.
+     * @param newGasStipend The new gas stipend to forward to ERC-1271 calls.
+     */
+    function setERC1271GasStipend(uint256 newGasStipend) external onlyOwner {
+        if (newGasStipend == 0) revert InvalidERC1271GasStipend();
+
+        uint256 oldGasStipend = erc1271GasStipend;
+        erc1271GasStipend = newGasStipend;
+        emit ERC1271GasStipendUpdated(oldGasStipend, newGasStipend);
+    }
 
     // =============================================================
     //                   Authorization Functions
     // =============================================================
+
+    /**
+     * @notice Execute a transfer with a signed authorization
+     * @dev EOA wallet signatures should be packed in the order of r, s, v.
+     * @param from          Payer's address (Authorizer)
+     * @param to            Payee's address
+     * @param value         Amount to be transferred
+     * @param validAfter    The time after which this is valid (unix time)
+     * @param validBefore   The time before which this is valid (unix time)
+     * @param nonce         Unique nonce
+     * @param signature     Signature bytes signed by an EOA wallet or a contract wallet
+     */
+    function transferWithAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce,
+        bytes memory signature
+    ) external nonReentrant {
+        _transferWithAuthorization(from, to, value, validAfter, validBefore, nonce, signature);
+    }
 
     /**
      * @notice Executes a token transfer authorized by a EIP-712 signature.
@@ -150,6 +214,18 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
         bytes32 r,
         bytes32 s
     ) external nonReentrant {
+        _transferWithAuthorization(from, to, value, validAfter, validBefore, nonce, abi.encodePacked(r, s, v));
+    }
+
+    function _transferWithAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce,
+        bytes memory signature
+    ) internal {
         if (from == address(0) || to == address(0)) revert ZeroAddress();
         if (validAfter > validBefore) revert InvalidAuthorizationDates();
         if (block.timestamp < validAfter) revert AuthorizationNotYetValid();
@@ -158,22 +234,12 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
 
         // forge-lint: disable-start(asm-keccak256)
         bytes32 structHash = keccak256(
-            abi.encode(
-                TRANSFER_WITH_AUTHORIZATION_TYPEHASH,
-                from,
-                to,
-                value,
-                validAfter,
-                validBefore,
-                nonce
-            )
+            abi.encode(TRANSFER_WITH_AUTHORIZATION_TYPEHASH, from, to, value, validAfter, validBefore, nonce)
         );
         // forge-lint: disable-end(asm-keccak256)
-        
+
         bytes32 hash = _hashTypedDataV4(structHash);
-        address signer = hash.recover(v, r, s);
-        
-        if (signer != from) revert InvalidSignature();
+        if (!_isValidSignatureNow(from, hash, signature)) revert InvalidSignature();
 
         // Checks-Effects-Interactions: Update state before external call.
         _authorizationStates[from][nonce] = true;
@@ -182,8 +248,30 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
         if (TOKEN.allowance(from, address(this)) < value) revert InsufficientAllowance();
         if (TOKEN.balanceOf(from) < value) revert InsufficientBalance();
 
-        bool success = TOKEN.transferFrom(from, to, value);
-        require(success, "Transfer failed");
+        TOKEN.safeTransferFrom(from, to, value);
+    }
+
+    /**
+     * @notice Execute a transfer where the recipient must submit
+     * @dev EOA wallet signatures should be packed in the order of r, s, v.
+     * @param from          Payer's address (Authorizer)
+     * @param to            Payee's address, must equal `msg.sender`
+     * @param value         Amount to be transferred
+     * @param validAfter    The time after which this is valid (unix time)
+     * @param validBefore   The time before which this is valid (unix time)
+     * @param nonce         Unique nonce
+     * @param signature     Signature bytes signed by an EOA wallet or a contract wallet
+     */
+    function receiveWithAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce,
+        bytes memory signature
+    ) external nonReentrant {
+        _receiveWithAuthorization(from, to, value, validAfter, validBefore, nonce, signature);
     }
 
     /**
@@ -211,30 +299,32 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
         bytes32 r,
         bytes32 s
     ) external nonReentrant {
+        _receiveWithAuthorization(from, to, value, validAfter, validBefore, nonce, abi.encodePacked(r, s, v));
+    }
+
+    function _receiveWithAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce,
+        bytes memory signature
+    ) internal {
         if (to != msg.sender) revert InvalidSignature();
         if (from == address(0)) revert ZeroAddress();
         if (validAfter > validBefore) revert InvalidAuthorizationDates();
         if (block.timestamp < validAfter) revert AuthorizationNotYetValid();
         if (block.timestamp > validBefore) revert AuthorizationExpired();
         if (_authorizationStates[from][nonce]) revert AuthorizationAlreadyUsed();
-        
+
         // forge-lint: disable-start(asm-keccak256)
-        bytes32 structHash = keccak256(
-            abi.encode(
-                RECEIVE_WITH_AUTHORIZATION_TYPEHASH,
-                from,
-                to,
-                value,
-                validAfter,
-                validBefore,
-                nonce
-            )
-        );
+        bytes32 structHash =
+            keccak256(abi.encode(RECEIVE_WITH_AUTHORIZATION_TYPEHASH, from, to, value, validAfter, validBefore, nonce));
         // forge-lint: disable-end(asm-keccak256)
+
         bytes32 hash = _hashTypedDataV4(structHash);
-        address signer = hash.recover(v, r, s);
-        
-        if (signer != from) revert InvalidSignature();
+        if (!_isValidSignatureNow(from, hash, signature)) revert InvalidSignature();
 
         // Checks-Effects-Interactions: Update state before external call.
         _authorizationStates[from][nonce] = true;
@@ -243,8 +333,18 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
         if (TOKEN.allowance(from, address(this)) < value) revert InsufficientAllowance();
         if (TOKEN.balanceOf(from) < value) revert InsufficientBalance();
 
-        bool success = TOKEN.transferFrom(from, to, value);
-        require(success, "Transfer failed");
+        TOKEN.safeTransferFrom(from, to, value);
+    }
+
+    /**
+     * @notice Cancel an unused authorization with a signed cancellation
+     * @dev EOA wallet signatures should be packed in the order of r, s, v.
+     * @param authorizer    The address that is canceling the authorization
+     * @param nonce         The nonce of the authorization to cancel
+     * @param signature     Signature bytes signed by an EOA wallet or a contract wallet
+     */
+    function cancelAuthorization(address authorizer, bytes32 nonce, bytes memory signature) external {
+        _cancelAuthorization(authorizer, nonce, signature);
     }
 
     /**
@@ -256,30 +356,46 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
      * @param r The r-value of the ECDSA signature.
      * @param s The s-value of the ECDSA signature.
      */
-    function cancelAuthorization(
-        address authorizer,
-        bytes32 nonce,
-        uint8 v,
-        bytes32 r,
-        bytes32 s
-    ) external {
+    function cancelAuthorization(address authorizer, bytes32 nonce, uint8 v, bytes32 r, bytes32 s) external {
+        _cancelAuthorization(authorizer, nonce, abi.encodePacked(r, s, v));
+    }
+
+    function _cancelAuthorization(address authorizer, bytes32 nonce, bytes memory signature) internal {
         if (_authorizationStates[authorizer][nonce]) revert AuthorizationAlreadyUsed();
 
         // forge-lint: disable-start(asm-keccak256)
-        bytes32 structHash = keccak256(
-            abi.encode(CANCEL_AUTHORIZATION_TYPEHASH, authorizer, nonce)
-        );
+        bytes32 structHash = keccak256(abi.encode(CANCEL_AUTHORIZATION_TYPEHASH, authorizer, nonce));
         // forge-lint: disable-end(asm-keccak256)
 
         bytes32 hash = _hashTypedDataV4(structHash);
-        address signer = hash.recover(v, r, s);
-        
-        if (signer != authorizer) revert InvalidSignature();
+        if (!_isValidSignatureNow(authorizer, hash, signature)) revert InvalidSignature();
 
         _authorizationStates[authorizer][nonce] = true;
         emit AuthorizationCanceled(authorizer, nonce);
     }
 
+    function _isValidSignatureNow(address signer, bytes32 hash, bytes memory signature) internal view returns (bool) {
+        if (signer.code.length == 0) {
+            // Some clients produce `v` as 0/1. Normalize to 27/28 for 65-byte ECDSA signatures.
+            if (signature.length == 65) {
+                uint8 v = uint8(signature[64]);
+                if (v == 0 || v == 1) {
+                    signature[64] = bytes1(v + 27);
+                }
+            }
+
+            (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(hash, signature);
+            return err == ECDSA.RecoverError.NoError && recovered == signer;
+        }
+
+        (bool success, bytes memory result) =
+            signer.staticcall{gas: erc1271GasStipend}(abi.encodeCall(IERC1271.isValidSignature, (hash, signature)));
+
+        // ERC-1271 specifies a bytes4 magic value (0x1626ba7e) returned on success.
+        // ABI encoding pads it to 32 bytes, so we can read the first 4 bytes.
+        if (!success || result.length < 32) return false;
+        return bytes4(bytes32(result)) == IERC1271.isValidSignature.selector;
+    }
 
     // =============================================================
     //                       View Functions
@@ -291,11 +407,7 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
      * @param nonce The nonce of the authorization.
      * @return bool True if the nonce has been used, false otherwise.
      */
-    function authorizationState(address authorizer, bytes32 nonce)
-        external
-        view
-        returns (bool)
-    {
+    function authorizationState(address authorizer, bytes32 nonce) external view returns (bool) {
         return _authorizationStates[authorizer][nonce];
     }
 
@@ -309,6 +421,7 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
     function DOMAIN_SEPARATOR() external view returns (bytes32) {
         return _domainSeparatorV4();
     }
+
     // forge-lint: disable-end(mixed-case-variable)
 
     /**

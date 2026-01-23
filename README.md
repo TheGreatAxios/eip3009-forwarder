@@ -16,6 +16,7 @@ The EIP3009Forwarder contract enables meta-transactions for ERC-20 tokens, allow
 - **Two transfer modes**:
   - `transferWithAuthorization`: Any relayer can submit
   - `receiveWithAuthorization`: Only the recipient can submit
+- **USDC-style signature bytes**: `bytes signature` variants support EOA (r,s,v) and contract wallets (ERC-1271)
 
 ## Installation
 
@@ -106,6 +107,16 @@ function transferWithAuthorization(
     uint256 validAfter,
     uint256 validBefore,
     bytes32 nonce,
+    bytes calldata signature
+) external;
+
+function transferWithAuthorization(
+    address from,
+    address to,
+    uint256 value,
+    uint256 validAfter,
+    uint256 validBefore,
+    bytes32 nonce,
     uint8 v,
     bytes32 r,
     bytes32 s
@@ -123,6 +134,16 @@ function receiveWithAuthorization(
     uint256 validAfter,
     uint256 validBefore,
     bytes32 nonce,
+    bytes calldata signature
+) external;
+
+function receiveWithAuthorization(
+    address from,
+    address to,
+    uint256 value,
+    uint256 validAfter,
+    uint256 validBefore,
+    bytes32 nonce,
     uint8 v,
     bytes32 r,
     bytes32 s
@@ -133,6 +154,12 @@ function receiveWithAuthorization(
 Cancels an unused authorization to prevent future execution.
 
 ```solidity
+function cancelAuthorization(
+    address authorizer,
+    bytes32 nonce,
+    bytes calldata signature
+) external;
+
 function cancelAuthorization(
     address authorizer,
     bytes32 nonce,
@@ -187,7 +214,7 @@ forwarder.transferWithAuthorization(
     validAfter,
     validBefore,
     nonce,
-    v, r, s
+    signature // EOA signatures are packed as r || s || v
 );
 ```
 
